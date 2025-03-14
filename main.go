@@ -1,0 +1,183 @@
+package main
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"time"
+
+	"github.com/go-rod/rod"
+	"github.com/go-rod/rod/lib/proto"
+	"github.com/joho/godotenv"
+	log "github.com/sirupsen/logrus"
+)
+
+func init() {
+	file, err := os.OpenFile("log.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.SetOutput(io.MultiWriter(os.Stdout, file))
+}
+
+func main() {
+	fmt.Println("Starting")
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatal("Error loading .env file")
+	}
+
+	browser := rod.New().MustConnect()
+	defer browser.MustClose()
+
+	pool := rod.NewPagePool(5)
+
+	createPage := func() (*rod.Page, error) {
+		return browser.MustIncognito().MustPage(), nil
+	}
+
+	lastRequestId := 0
+
+	http.HandleFunc("/", func(response http.ResponseWriter, request *http.Request) {
+		start := time.Now()
+
+		lastRequestId++
+		requestId := lastRequestId
+
+		logger := log.WithField("request", requestId)
+		logger.Infof("New request: %s %s%s", request.Method, request.Host, request.RequestURI)
+
+		// Ensure the request method is GET or POST.
+		if request.Method != "GET" && request.Method != "POST" {
+			msg := fmt.Sprintf("Invalid HTTP method %s", request.Method)
+			http.Error(response, msg, http.StatusBadRequest)
+			logger.Warnln(msg)
+			return
+		}
+
+		page, err := pool.Get(createPage)
+		if err != nil {
+			msg := "Error creating page"
+			http.Error(response, msg, http.StatusInternalServerError)
+			logger.Fatalf("%s: %s", msg, err)
+		}
+		logger.Infof("Got page after %s", time.Since(start))
+		defer pool.Put(page)
+
+		if request.Method == "POST" {
+			// The HTML to render is in the request body.
+			body, err := io.ReadAll(request.Body)
+			if err != nil {
+				msg := "Error reading request body"
+				http.Error(response, msg, http.StatusInternalServerError)
+				logger.Warnf("%s: %s", msg, err)
+				return
+			}
+			dataUrl := "data:text/html;charset=utf-8," + url.PathEscape(string(body))
+			//fmt.Printf("Rendering page from data URL: %s\n", dataUrl)
+			logger.Infoln("Rendering page from data URL")
+
+			err = request.Body.Close()
+			if err != nil {
+				logger.Warnf("Error closing request body: %s", err)
+			}
+			//page = browser.MustPage(dataUrl)
+			logger.Infoln("Navigating to data URL")
+			page.MustNavigate(dataUrl)
+		}
+
+		if request.Method == "GET" {
+			query := request.URL.Query()
+			if !query.Has("url") {
+				msg := "Missing request parameter 'url'"
+				logger.Warnln(msg)
+				http.Error(response, msg, http.StatusBadRequest)
+				return
+			}
+
+			pageUrl := query.Get("url")
+			logger.Infof("Navigating to URL: %s", pageUrl)
+			page.MustNavigate(pageUrl)
+		}
+
+		start = time.Now()
+		page.MustWaitLoad().MustWaitStable().MustWaitIdle()
+		logger.Infof("Page loaded in %v", time.Since(start))
+
+		pdf := pageToPDF(page, logger)
+		defer func() {
+			err := pdf.Close()
+			if err != nil {
+				logger.Warnf("Error closing PDF: %s", err)
+			}
+		}()
+
+		response.Header().Set("Content-Type", "application/pdf")
+
+		data, err := io.ReadAll(pdf)
+		if err != nil {
+			msg := "Error reading PDF"
+			logger.Warnf("%s: %s", msg, err)
+			http.Error(response, msg, http.StatusInternalServerError)
+			return
+		}
+		if _, err := response.Write(data); err != nil {
+			msg := "Error writing PDF"
+			logger.Warnf("%s: %s", msg, err)
+			http.Error(response, msg, http.StatusInternalServerError)
+			return
+		}
+		logger.Infof("Completed request after %s", time.Since(start))
+	})
+
+	addr := os.Getenv("LISTEN_ADDRESS")
+	fmt.Printf("Listening at: %s\n", addr)
+	fmt.Println(" - GET /?url=https://example.com to render a page")
+	fmt.Println(" - POST / with HTML to render a page")
+	fmt.Println("Press Ctrl+C to quit")
+	err = http.ListenAndServe(addr, nil)
+	if errors.Is(err, http.ErrServerClosed) {
+		log.Infof("server closed")
+	} else if err != nil {
+		log.Fatalf("error starting server: %s", err)
+	}
+}
+
+func pageToPDF(page *rod.Page, logger *log.Entry) *rod.StreamReader {
+	now := time.Now()
+	title := page.MustElement("head title").MustText()
+
+	logger.Infof("Printing page '%s'", title)
+
+	zero := 0.0
+	one := 1.0
+	paperWidth := 8.27
+	paperHeight := 11.7
+
+	pdfOptions := &proto.PagePrintToPDF{
+		PageRanges:          "1",
+		MarginTop:           &zero,
+		MarginBottom:        &zero,
+		MarginLeft:          &zero,
+		MarginRight:         &zero,
+		Landscape:           false,
+		DisplayHeaderFooter: false,
+		HeaderTemplate:      "",
+		FooterTemplate:      "",
+		PrintBackground:     true,
+		Scale:               &one,
+		PaperWidth:          &paperWidth,
+		PaperHeight:         &paperHeight,
+		PreferCSSPageSize:   false,
+	}
+	pdf, err := page.PDF(pdfOptions)
+	if err != nil {
+		logger.Panicf("Error rendering PDF: %s", err)
+	}
+	logger.Infof("Rendered PDF in %v", time.Since(now))
+
+	return pdf
+}
