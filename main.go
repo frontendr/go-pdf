@@ -13,6 +13,8 @@ import (
 	"github.com/go-rod/rod/lib/proto"
 	"github.com/joho/godotenv"
 	log "github.com/sirupsen/logrus"
+
+	"go-pdf/utils"
 )
 
 func init() {
@@ -107,7 +109,7 @@ func main() {
 		page.MustWaitLoad().MustWaitStable().MustWaitIdle()
 		logger.Infof("Page loaded in %v", time.Since(start))
 
-		pdf := pageToPDF(page, logger)
+		pdf := pageToPDF(page, getPDFOptionsFromRequest(request), logger)
 		defer func() {
 			err := pdf.Close()
 			if err != nil {
@@ -146,33 +148,33 @@ func main() {
 	}
 }
 
-func pageToPDF(page *rod.Page, logger *log.Entry) *rod.StreamReader {
+func getPDFOptionsFromRequest(r *http.Request) *proto.PagePrintToPDF {
+	query := r.URL.Query()
+
+	return &proto.PagePrintToPDF{
+		Scale:               utils.StringToFloat64(utils.GetQueryParam(query, "scale", "1.0")),
+		PageRanges:          utils.GetQueryParam(query, "pageRanges"),
+		HeaderTemplate:      utils.GetQueryParam(query, "headerTemplate", ""),
+		FooterTemplate:      utils.GetQueryParam(query, "footerTemplate", ""),
+		PrintBackground:     utils.GetQueryParamBool(query, "printBackground", true),
+		DisplayHeaderFooter: utils.GetQueryParamBool(query, "displayHeaderFooter", false),
+		MarginTop:           utils.StringToFloat64(utils.GetQueryParam(query, "marginTop", "0")),
+		MarginBottom:        utils.StringToFloat64(utils.GetQueryParam(query, "marginBottom", "0")),
+		MarginLeft:          utils.StringToFloat64(utils.GetQueryParam(query, "marginLeft", "0")),
+		MarginRight:         utils.StringToFloat64(utils.GetQueryParam(query, "marginRight", "0")),
+		PaperWidth:          utils.StringToFloat64(utils.GetQueryParam(query, "paperWidth", utils.GetQueryParam(query, "width", "8.27"))),
+		PaperHeight:         utils.StringToFloat64(utils.GetQueryParam(query, "paperHeight", utils.GetQueryParam(query, "height", "11.7"))),
+		Landscape:           utils.GetQueryParamBool(query, "landscape", false),
+		PreferCSSPageSize:   utils.GetQueryParamBool(query, "preferCSSPageSize", false),
+	}
+}
+
+func pageToPDF(page *rod.Page, pdfOptions *proto.PagePrintToPDF, logger *log.Entry) *rod.StreamReader {
 	now := time.Now()
 	title := page.MustElement("head title").MustText()
 
 	logger.Infof("Printing page '%s'", title)
 
-	zero := 0.0
-	one := 1.0
-	paperWidth := 8.27
-	paperHeight := 11.7
-
-	pdfOptions := &proto.PagePrintToPDF{
-		PageRanges:          "1",
-		MarginTop:           &zero,
-		MarginBottom:        &zero,
-		MarginLeft:          &zero,
-		MarginRight:         &zero,
-		Landscape:           false,
-		DisplayHeaderFooter: false,
-		HeaderTemplate:      "",
-		FooterTemplate:      "",
-		PrintBackground:     true,
-		Scale:               &one,
-		PaperWidth:          &paperWidth,
-		PaperHeight:         &paperHeight,
-		PreferCSSPageSize:   false,
-	}
 	pdf, err := page.PDF(pdfOptions)
 	if err != nil {
 		logger.Panicf("Error rendering PDF: %s", err)
