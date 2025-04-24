@@ -171,9 +171,11 @@ func getPDFOptionsFromRequest(r *http.Request) *proto.PagePrintToPDF {
 
 func pageToPDF(page *rod.Page, pdfOptions *proto.PagePrintToPDF, logger *log.Entry) *rod.StreamReader {
 	now := time.Now()
-	title := page.MustElement("head title").MustText()
-
-	logger.Infof("Printing page '%s'", title)
+	titleElement, err := page.Element("head title")
+	if err == nil {
+		title := titleElement.MustText()
+		logger.Infof("Printing page '%s'", title)
+	}
 
 	pdf, err := page.PDF(pdfOptions)
 	if err != nil {
