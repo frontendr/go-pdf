@@ -2,48 +2,104 @@ package main
 
 import (
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
+	_ "net/http/pprof"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/proto"
 	"github.com/joho/godotenv"
+	"github.com/pkg/profile"
 	log "github.com/sirupsen/logrus"
 
 	"go-pdf/utils"
 )
 
 func init() {
-	file, err := os.OpenFile("log.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.SetOutput(io.MultiWriter(os.Stdout, file))
-}
-
-func main() {
 	fmt.Println("Starting")
 	err := godotenv.Load()
 	if err != nil {
-		log.Fatal("Error loading .env file")
+		fmt.Fprintln(os.Stderr, "Error loading .env file")
+		os.Exit(1)
+	}
+}
+
+func setupLogging(logFile string, logLevel string) {
+	parsedLogLevel, err := log.ParseLevel(logLevel)
+	if err != nil {
+		log.Fatalf("Invalid log level: %s", err)
+	}
+	log.SetLevel(parsedLogLevel)
+
+	if logFile != "" {
+		file, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.SetOutput(io.MultiWriter(os.Stdout, file))
+		fmt.Println(" - Log file:", logFile)
+	}
+	fmt.Println(" - Log level:", logLevel)
+}
+
+func main() {
+	// Collect environment variables
+	pdfEndpoint := utils.GetEnv("PDF_ENDPOINT", "/pdf")
+	listenAddress := utils.GetEnv("LISTEN_ADDRESS", "0.0.0.0:3005")
+	profilingEnabled := utils.GetEnvBool("PROFILING_ENABLED", false)
+	pagePoolSize := utils.GetEnvInt("PAGE_POOL_SIZE", 5)
+	logLevel := utils.GetEnv("LOG_LEVEL", "info")
+	logFile := utils.GetEnv("LOG_FILE", "")
+
+	// Optionally override the settings with command line arguments:
+	flag.IntVar(&pagePoolSize, "pool", pagePoolSize, "Page pool size")
+	flag.StringVar(&pdfEndpoint, "path", pdfEndpoint, "PDF endpoint or path e.g. /pdf")
+	flag.StringVar(&listenAddress, "host", listenAddress, "Listen address e.g. 0.0.0.0:3005")
+	flag.BoolVar(&profilingEnabled, "profiling", profilingEnabled, "Enable profiling")
+	flag.StringVar(&logLevel, "log", logLevel, "Log level e.g. 'debug' or 'info'")
+	flag.StringVar(&logFile, "log-file", logFile, "Log file e.g. 'log.log'")
+	flag.Parse()
+
+	setupLogging(logFile, logLevel)
+
+	// Start the optional profiler
+	if profilingEnabled {
+		defer profile.Start(profile.MemProfile).Stop()
 	}
 
 	browser := rod.New().MustConnect()
 	defer browser.MustClose()
 
-	pool := rod.NewPagePool(5)
+	pool := rod.NewPagePool(pagePoolSize)
+	// pagePoolSize == cap(pool)
 
 	createPage := func() (*rod.Page, error) {
 		return browser.MustIncognito().MustPage(), nil
 	}
 
+	logPoolSize := func(logger *log.Entry) {
+		logger.Debugf("Pool size: %d/%d", pagePoolSize-len(pool), pagePoolSize)
+	}
+
+	// Keep track of request IDs for logging
 	lastRequestId := 0
 
+	// Handle the root URL or any other URL
 	http.HandleFunc("/", func(response http.ResponseWriter, request *http.Request) {
+		renderTemplate(response, "templates/index.html", map[string]string{
+			"PDF_ENDPOINT":   pdfEndpoint,
+			"LISTEN_ADDRESS": listenAddress,
+		})
+	})
+
+	// Handler for the PDF endpoint
+	pdfHandler := func(response http.ResponseWriter, request *http.Request) {
 		start := time.Now()
 
 		lastRequestId++
@@ -60,14 +116,22 @@ func main() {
 			return
 		}
 
+		// Get a page from the pool
 		page, err := pool.Get(createPage)
 		if err != nil {
 			msg := "Error creating page"
 			http.Error(response, msg, http.StatusInternalServerError)
 			logger.Fatalf("%s: %s", msg, err)
+			return
 		}
-		logger.Infof("Got page after %s", time.Since(start))
-		defer pool.Put(page)
+		logger.Debugf("Got page from pool after %s", time.Since(start))
+		logPoolSize(logger)
+
+		defer func() {
+			// Put the page back in the pool
+			pool.Put(page)
+			logPoolSize(logger)
+		}()
 
 		if request.Method == "POST" {
 			// The HTML to render is in the request body.
@@ -79,14 +143,12 @@ func main() {
 				return
 			}
 			dataUrl := "data:text/html;charset=utf-8," + url.PathEscape(string(body))
-			//fmt.Printf("Rendering page from data URL: %s\n", dataUrl)
 			logger.Infoln("Rendering page from data URL")
 
 			err = request.Body.Close()
 			if err != nil {
 				logger.Warnf("Error closing request body: %s", err)
 			}
-			//page = browser.MustPage(dataUrl)
 			logger.Infoln("Navigating to data URL")
 			page.MustNavigate(dataUrl)
 		}
@@ -107,7 +169,7 @@ func main() {
 
 		start = time.Now()
 		page.MustWaitLoad().MustWaitStable().MustWaitIdle()
-		logger.Infof("Page loaded in %v", time.Since(start))
+		logger.Debugf("Page loaded in %v", time.Since(start))
 
 		pdf := pageToPDF(page, getPDFOptionsFromRequest(request), logger)
 		defer func() {
@@ -126,6 +188,7 @@ func main() {
 			http.Error(response, msg, http.StatusInternalServerError)
 			return
 		}
+		logger.Debugf("PDF size: %d bytes", len(data))
 		if _, err := response.Write(data); err != nil {
 			msg := "Error writing PDF"
 			logger.Warnf("%s: %s", msg, err)
@@ -133,14 +196,27 @@ func main() {
 			return
 		}
 		logger.Infof("Completed request after %s", time.Since(start))
-	})
+	}
 
-	addr := os.Getenv("LISTEN_ADDRESS")
-	fmt.Printf("Listening at: %s\n", addr)
-	fmt.Println(" - GET /?url=https://example.com to render a page")
-	fmt.Println(" - POST / with HTML to render a page")
-	fmt.Println("Press Ctrl+C to quit")
-	err = http.ListenAndServe(addr, nil)
+	http.HandleFunc(pdfEndpoint, pdfHandler)
+	if !strings.HasSuffix(pdfEndpoint, "/") {
+		// Also handle requests with a trailing slash:
+		http.HandleFunc(pdfEndpoint+"/", pdfHandler)
+	} else {
+		// Also handle requests without a trailing slash:
+		http.HandleFunc(pdfEndpoint[:len(pdfEndpoint)-1], pdfHandler)
+	}
+
+	fmt.Printf(" - Listening at: %s\n", listenAddress)
+	fmt.Println("Usage:")
+	fmt.Printf(" - GET %s?url=https://example.com to render a page\n", pdfEndpoint)
+	fmt.Printf(" - POST %s with HTML to render a page\n", pdfEndpoint)
+	if profilingEnabled {
+		fmt.Println("Profiling enabled")
+	}
+	// fmt.Println("Press Ctrl+C to quit")
+
+	err := http.ListenAndServe(listenAddress, nil)
 	if errors.Is(err, http.ErrServerClosed) {
 		log.Infof("server closed")
 	} else if err != nil {
@@ -171,17 +247,41 @@ func getPDFOptionsFromRequest(r *http.Request) *proto.PagePrintToPDF {
 
 func pageToPDF(page *rod.Page, pdfOptions *proto.PagePrintToPDF, logger *log.Entry) *rod.StreamReader {
 	now := time.Now()
-	titleElement, err := page.Element("head title")
-	if err == nil {
-		title := titleElement.MustText()
-		logger.Infof("Printing page '%s'", title)
+
+	if logger.Level <= log.DebugLevel {
+		titleElement, err := page.Element("head title")
+		if err == nil {
+			title := titleElement.MustText()
+			logger.Debugf("Printing page '%s'", title)
+		} else {
+			logger.Debugf("Printing page")
+		}
 	}
 
 	pdf, err := page.PDF(pdfOptions)
 	if err != nil {
 		logger.Panicf("Error rendering PDF: %s", err)
 	}
-	logger.Infof("Rendered PDF in %v", time.Since(now))
+	logger.Debugf("Rendered PDF in %v", time.Since(now))
 
 	return pdf
+}
+
+func renderTemplate(w http.ResponseWriter, templatePath string, values map[string]string) {
+	indexContent, err := os.ReadFile(templatePath)
+	if err != nil {
+		http.Error(w, "Error reading template", http.StatusInternalServerError)
+		log.Errorf("Error reading template %s: %v", templatePath, err)
+		return
+	}
+	modifiedContent := string(indexContent)
+	for key, val := range values {
+		modifiedContent = strings.Replace(modifiedContent, "{{"+key+"}}", val, -1)
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, err = w.Write([]byte(modifiedContent))
+	if err != nil {
+		log.Errorf("Error writing response: %v", err)
+	}
 }
