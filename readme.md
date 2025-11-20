@@ -181,6 +181,28 @@ The Docker image uses `.env.docker` as the default configuration file, which set
 
 You can override any of these values using the `-e` flag when running the container.
 
+**With persistent log file:**
+
+To write logs to a file that's accessible outside the container, use a volume mount:
+
+```bash
+# Create a logs directory on your host
+mkdir -p logs
+
+# Run with volume mount for log file
+docker run -d -p 80:80 \
+  -v $(pwd)/logs:/app/logs \
+  -e LOG_FILE=/app/logs/go-pdf.log \
+  --name go-pdf \
+  go-pdf
+```
+
+The log file will be available at `./logs/go-pdf.log` on your host machine. You can tail it with:
+
+```bash
+tail -f logs/go-pdf.log
+```
+
 ### Docker Management Commands
 
 ```bash

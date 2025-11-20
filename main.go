@@ -9,6 +9,7 @@ import (
 	_ "net/http/pprof"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -38,6 +39,15 @@ func setupLogging(logFile string, logLevel string) {
 	log.SetLevel(parsedLogLevel)
 
 	if logFile != "" {
+		// Create the directory if it doesn't exist
+		dir := filepath.Dir(logFile)
+		if dir != "." && dir != "" {
+			err := os.MkdirAll(dir, 0755)
+			if err != nil {
+				log.Fatalf("Failed to create log directory: %s", err)
+			}
+		}
+
 		file, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0666)
 		if err != nil {
 			log.Fatal(err)
