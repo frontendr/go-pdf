@@ -1,6 +1,6 @@
 # PDF Rendering Service
 
-A high-performance PDF generation service that converts web pages and HTML content to PDF files using a headless browser. Built with Go and powered by [go-rod](https://github.com/go-rod/rod).
+A high-performance PDF generation service that converts web pages and HTML content to PDF files using a headless browser. Built with Go and powered by [go-rod](https://go-rod.github.io/).
 
 ## Features
 
