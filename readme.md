@@ -16,17 +16,22 @@ A high-performance PDF generation service that converts web pages and HTML conte
 ### Using Docker (Recommended)
 
 ```bash
-# Build the image
+# Build the image directly from GitHub
+docker build -t go-pdf https://github.com/frontendr/go-pdf.git
+
+# OR build the image after checking out this repository
 docker build -t go-pdf .
 
-# Run the container
-docker run -d -p 80:80 --name go-pdf go-pdf
+# Run the container, binding your local port 3005 to the container's port 80:
+docker run -d -p 3005:80 --name go-pdf go-pdf
 
 # Access the service
-curl "http://localhost:80/pdf?url=https://example.com" > output.pdf
+curl "http://localhost:3005/pdf?url=https://example.com" > output.pdf
 ```
 
 ### Running Locally
+
+After checking out the repository, you can run these commands from the root of the repository:
 
 ```bash
 # Install dependencies
