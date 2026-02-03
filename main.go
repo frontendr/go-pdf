@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -26,7 +27,7 @@ func init() {
 	fmt.Println("Starting")
 	err := godotenv.Load()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "Error loading .env file")
+		_, _ = fmt.Fprintln(os.Stderr, "Error loading .env file")
 		os.Exit(1)
 	}
 }
@@ -42,8 +43,7 @@ func setupLogging(logFile string, logLevel string) {
 		// Create the directory if it doesn't exist
 		dir := filepath.Dir(logFile)
 		if dir != "." && dir != "" {
-			err := os.MkdirAll(dir, 0755)
-			if err != nil {
+			if err := os.MkdirAll(dir, 0755); err != nil {
 				log.Fatalf("Failed to create log directory: %s", err)
 			}
 		}
@@ -56,6 +56,20 @@ func setupLogging(logFile string, logLevel string) {
 		fmt.Println(" - Log file:", logFile)
 	}
 	fmt.Println(" - Log level:", logLevel)
+}
+
+// recoverPanic is a middleware that recovers from panics and logs them
+func recoverPanic(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := recover(); err != nil {
+				log.Errorf("PANIC recovered: %v\nStack trace:\n%s", err, debug.Stack())
+				errorMsg := fmt.Sprintf("Internal server error: %v", err)
+				http.Error(w, errorMsg, http.StatusInternalServerError)
+			}
+		}()
+		next(w, r)
+	}
 }
 
 func main() {
@@ -83,14 +97,29 @@ func main() {
 		defer profile.Start(profile.MemProfile).Stop()
 	}
 
-	browser := rod.New().MustConnect()
-	defer browser.MustClose()
+	browser := rod.New()
+	if err := browser.Connect(); err != nil {
+		log.Fatalf("Failed to connect to browser: %s", err)
+	}
+	defer func() {
+		if err := browser.Close(); err != nil {
+			log.Errorf("Error closing browser: %s", err)
+		}
+	}()
 
 	pool := rod.NewPagePool(pagePoolSize)
 	// pagePoolSize == cap(pool)
 
 	createPage := func() (*rod.Page, error) {
-		return browser.MustIncognito().MustPage(), nil
+		incognito, err := browser.Incognito()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create incognito context: %w", err)
+		}
+		page, err := incognito.Page(proto.TargetCreateTarget{})
+		if err != nil {
+			return nil, fmt.Errorf("failed to create page: %w", err)
+		}
+		return page, nil
 	}
 
 	logPoolSize := func(logger *log.Entry) {
@@ -101,12 +130,12 @@ func main() {
 	lastRequestId := 0
 
 	// Handle the root URL or any other URL
-	http.HandleFunc("/", func(response http.ResponseWriter, request *http.Request) {
+	http.HandleFunc("/", recoverPanic(func(response http.ResponseWriter, request *http.Request) {
 		renderTemplate(response, "templates/index.html", map[string]string{
 			"PDF_ENDPOINT":   pdfEndpoint,
 			"LISTEN_ADDRESS": listenAddress,
 		})
-	})
+	}))
 
 	// Handler for the PDF endpoint
 	pdfHandler := func(response http.ResponseWriter, request *http.Request) {
@@ -131,7 +160,7 @@ func main() {
 		if err != nil {
 			msg := "Error creating page"
 			http.Error(response, msg, http.StatusInternalServerError)
-			logger.Fatalf("%s: %s", msg, err)
+			logger.Errorf("%s: %s", msg, err)
 			return
 		}
 		logger.Debugf("Got page from pool after %s", time.Since(start))
@@ -155,12 +184,16 @@ func main() {
 			dataUrl := "data:text/html;charset=utf-8," + url.PathEscape(string(body))
 			logger.Infoln("Rendering page from data URL")
 
-			err = request.Body.Close()
-			if err != nil {
+			if err = request.Body.Close(); err != nil {
 				logger.Warnf("Error closing request body: %s", err)
 			}
 			logger.Infoln("Navigating to data URL")
-			page.MustNavigate(dataUrl)
+			if err = page.Navigate(dataUrl); err != nil {
+				msg := "Error navigating to data URL"
+				http.Error(response, msg, http.StatusInternalServerError)
+				logger.Errorf("%s: %s", msg, err)
+				return
+			}
 		}
 
 		if request.Method == "GET" {
@@ -174,17 +207,32 @@ func main() {
 
 			pageUrl := query.Get("url")
 			logger.Infof("Navigating to URL: %s", pageUrl)
-			page.MustNavigate(pageUrl)
+			if err = page.Navigate(pageUrl); err != nil {
+				msg := "Error navigating to URL"
+				http.Error(response, msg, http.StatusInternalServerError)
+				logger.Errorf("%s: %s", msg, err)
+				return
+			}
 		}
 
 		start = time.Now()
-		page.MustWaitLoad().MustWaitStable().MustWaitIdle()
+		if err = page.WaitLoad(); err != nil {
+			msg := "Error waiting for page to load"
+			http.Error(response, msg, http.StatusInternalServerError)
+			logger.Errorf("%s: %s", msg, err)
+			return
+		}
+		if err = page.WaitStable(time.Second); err != nil {
+			logger.Warnf("Error waiting for page to be stable: %s", err)
+		}
+		if err = page.WaitIdle(time.Second); err != nil {
+			logger.Warnf("Error waiting for page to be idle: %s", err)
+		}
 		logger.Debugf("Page loaded in %v", time.Since(start))
 
 		pdf := pageToPDF(page, getPDFOptionsFromRequest(request), logger)
 		defer func() {
-			err := pdf.Close()
-			if err != nil {
+			if err := pdf.Close(); err != nil {
 				logger.Warnf("Error closing PDF: %s", err)
 			}
 		}()
@@ -208,13 +256,13 @@ func main() {
 		logger.Infof("Completed request after %s", time.Since(start))
 	}
 
-	http.HandleFunc(pdfEndpoint, pdfHandler)
+	http.HandleFunc(pdfEndpoint, recoverPanic(pdfHandler))
 	if !strings.HasSuffix(pdfEndpoint, "/") {
 		// Also handle requests with a trailing slash:
-		http.HandleFunc(pdfEndpoint+"/", pdfHandler)
+		http.HandleFunc(pdfEndpoint+"/", recoverPanic(pdfHandler))
 	} else {
 		// Also handle requests without a trailing slash:
-		http.HandleFunc(pdfEndpoint[:len(pdfEndpoint)-1], pdfHandler)
+		http.HandleFunc(pdfEndpoint[:len(pdfEndpoint)-1], recoverPanic(pdfHandler))
 	}
 
 	fmt.Printf(" - Listening at: %s\n", listenAddress)
@@ -261,8 +309,12 @@ func pageToPDF(page *rod.Page, pdfOptions *proto.PagePrintToPDF, logger *log.Ent
 	if logger.Level <= log.DebugLevel {
 		titleElement, err := page.Element("head title")
 		if err == nil {
-			title := titleElement.MustText()
-			logger.Debugf("Printing page '%s'", title)
+			title, err := titleElement.Text()
+			if err == nil {
+				logger.Debugf("Printing page '%s'", title)
+			} else {
+				logger.Debugf("Printing page")
+			}
 		} else {
 			logger.Debugf("Printing page")
 		}
@@ -270,7 +322,9 @@ func pageToPDF(page *rod.Page, pdfOptions *proto.PagePrintToPDF, logger *log.Ent
 
 	pdf, err := page.PDF(pdfOptions)
 	if err != nil {
-		logger.Panicf("Error rendering PDF: %s", err)
+		// Log the error and panic - will be caught by recoverPanic middleware
+		logger.Errorf("Error rendering PDF: %s", err)
+		panic(fmt.Sprintf("Error rendering PDF: %s", err))
 	}
 	logger.Debugf("Rendered PDF in %v", time.Since(now))
 
@@ -280,7 +334,8 @@ func pageToPDF(page *rod.Page, pdfOptions *proto.PagePrintToPDF, logger *log.Ent
 func renderTemplate(w http.ResponseWriter, templatePath string, values map[string]string) {
 	indexContent, err := os.ReadFile(templatePath)
 	if err != nil {
-		http.Error(w, "Error reading template", http.StatusInternalServerError)
+		errorMsg := fmt.Sprintf("Error reading template: %v", err)
+		http.Error(w, errorMsg, http.StatusInternalServerError)
 		log.Errorf("Error reading template %s: %v", templatePath, err)
 		return
 	}
