@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -80,6 +81,7 @@ func main() {
 	pagePoolSize := utils.GetEnvInt("PAGE_POOL_SIZE", 5)
 	logLevel := utils.GetEnv("LOG_LEVEL", "info")
 	logFile := utils.GetEnv("LOG_FILE", "")
+	browserRestartInterval := utils.GetEnvInt("BROWSER_RESTART_INTERVAL", 0) // 0 = disabled
 
 	// Optionally override the settings with command line arguments:
 	flag.IntVar(&pagePoolSize, "pool", pagePoolSize, "Page pool size")
@@ -88,6 +90,7 @@ func main() {
 	flag.BoolVar(&profilingEnabled, "profiling", profilingEnabled, "Enable profiling")
 	flag.StringVar(&logLevel, "log", logLevel, "Log level e.g. 'debug' or 'info'")
 	flag.StringVar(&logFile, "log-file", logFile, "Log file e.g. 'log.log'")
+	flag.IntVar(&browserRestartInterval, "browser-restart", browserRestartInterval, "Browser restart interval in seconds (0 = disabled)")
 	flag.Parse()
 
 	setupLogging(logFile, logLevel)
@@ -97,21 +100,74 @@ func main() {
 		defer profile.Start(profile.MemProfile).Stop()
 	}
 
-	browser := rod.New()
-	if err := browser.Connect(); err != nil {
+	var browser *rod.Browser
+	var browserLock sync.Mutex
+
+	// Function to connect/reconnect browser
+	connectBrowser := func() error {
+		browserLock.Lock()
+		defer browserLock.Unlock()
+
+		if browser != nil {
+			if err := browser.Close(); err != nil {
+				log.Warnf("Error closing existing browser: %s", err)
+			}
+		}
+
+		browser = rod.New()
+		if err := browser.Connect(); err != nil {
+			return fmt.Errorf("failed to connect to browser: %w", err)
+		}
+		//log.Info("Browser connected successfully")
+		return nil
+	}
+
+	// Initial browser connection
+	if err := connectBrowser(); err != nil {
 		log.Fatalf("Failed to connect to browser: %s", err)
 	}
 	defer func() {
-		if err := browser.Close(); err != nil {
-			log.Errorf("Error closing browser: %s", err)
+		browserLock.Lock()
+		defer browserLock.Unlock()
+		if browser != nil {
+			if err := browser.Close(); err != nil {
+				log.Errorf("Error closing browser: %s", err)
+			}
 		}
 	}()
+
+	// Start periodic browser restart if configured
+	if browserRestartInterval > 0 {
+		fmt.Printf(" - Browser will restart every %d seconds\n", browserRestartInterval)
+		go func() {
+			fmt.Println("Starting browser restart ticker")
+			ticker := time.NewTicker(time.Duration(browserRestartInterval) * time.Second)
+			defer ticker.Stop()
+
+			for range ticker.C {
+				log.Info("Performing scheduled browser restart")
+				if err := connectBrowser(); err != nil {
+					log.Errorf("Failed to restart browser: %s", err)
+				} else {
+					log.Info("Browser restarted successfully")
+				}
+			}
+		}()
+	}
 
 	pool := rod.NewPagePool(pagePoolSize)
 	// pagePoolSize == cap(pool)
 
 	createPage := func() (*rod.Page, error) {
-		incognito, err := browser.Incognito()
+		browserLock.Lock()
+		currentBrowser := browser
+		browserLock.Unlock()
+
+		if currentBrowser == nil {
+			return nil, fmt.Errorf("browser not connected")
+		}
+
+		incognito, err := currentBrowser.Incognito()
 		if err != nil {
 			return nil, fmt.Errorf("failed to create incognito context: %w", err)
 		}

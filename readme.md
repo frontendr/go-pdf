@@ -105,6 +105,7 @@ The service can be configured using environment variables or command-line flags.
 | `PAGE_POOL_SIZE` | `-pool` | Page pool size | `5` |
 | `LOG_LEVEL` | `-log` | Log level (debug, info, warn, error, fatal, panic) | `info` |
 | `LOG_FILE` | `-log-file` | Log file path | `` |
+| `BROWSER_RESTART_INTERVAL` | `-browser-restart` | Browser restart interval in seconds (0 = disabled) | `0` |
 
 ### Configuration Examples
 
@@ -131,6 +132,22 @@ PROFILING_ENABLED=false
 PAGE_POOL_SIZE=5
 LOG_LEVEL=info
 LOG_FILE=
+BROWSER_RESTART_INTERVAL=0
+```
+
+**Browser Restart Interval:**
+
+The `BROWSER_RESTART_INTERVAL` setting allows you to automatically restart the browser connection at regular intervals. This can help prevent issues with long-running browser processes:
+
+```bash
+# Restart browser every 24 hours (86400 seconds)
+BROWSER_RESTART_INTERVAL=86400 ./go-pdf
+
+# Restart browser every 12 hours (43200 seconds)
+BROWSER_RESTART_INTERVAL=43200 ./go-pdf
+
+# Disable automatic restart (default)
+BROWSER_RESTART_INTERVAL=0 ./go-pdf
 ```
 
 ## Docker
@@ -167,6 +184,16 @@ docker run -d -p 8080:80 --name go-pdf go-pdf
 docker run -d -p 80:80 \
   -e PAGE_POOL_SIZE=10 \
   -e LOG_LEVEL=debug \
+  --name go-pdf \
+  go-pdf
+```
+
+**With automatic browser restart (recommended for production):**
+
+```bash
+# Restart browser every 24 hours to prevent connection issues
+docker run -d -p 80:80 \
+  -e BROWSER_RESTART_INTERVAL=86400 \
   --name go-pdf \
   go-pdf
 ```
