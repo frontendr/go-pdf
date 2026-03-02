@@ -73,6 +73,18 @@ func recoverPanic(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// isClosedConnectionError checks if the error is caused by a closed network connection
+func isClosedConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errMsg := err.Error()
+	return strings.Contains(errMsg, "use of closed network connection") ||
+		strings.Contains(errMsg, "connection refused") ||
+		strings.Contains(errMsg, "broken pipe") ||
+		strings.Contains(errMsg, "EOF")
+}
+
 func main() {
 	// Collect environment variables
 	pdfEndpoint := utils.GetEnv("PDF_ENDPOINT", "/pdf")
@@ -103,10 +115,21 @@ func main() {
 	var browser *rod.Browser
 	var browserLock sync.Mutex
 
+	pool := rod.NewPagePool(pagePoolSize)
+	// pagePoolSize == cap(pool)
+
 	// Function to connect/reconnect browser
 	connectBrowser := func() error {
 		browserLock.Lock()
 		defer browserLock.Unlock()
+
+		// Drain the page pool - old pages are connected to the old browser
+		pool.Cleanup(func(p *rod.Page) {
+			log.Debug("Closing stale page from pool")
+			if err := p.Close(); err != nil {
+				log.Warnf("Error closing stale page: %s", err)
+			}
+		})
 
 		if browser != nil {
 			if err := browser.Close(); err != nil {
@@ -118,7 +141,6 @@ func main() {
 		if err := browser.Connect(); err != nil {
 			return fmt.Errorf("failed to connect to browser: %w", err)
 		}
-		//log.Info("Browser connected successfully")
 		return nil
 	}
 
@@ -127,6 +149,11 @@ func main() {
 		log.Fatalf("Failed to connect to browser: %s", err)
 	}
 	defer func() {
+		pool.Cleanup(func(p *rod.Page) {
+			if err := p.Close(); err != nil {
+				log.Warnf("Error closing page: %s", err)
+			}
+		})
 		browserLock.Lock()
 		defer browserLock.Unlock()
 		if browser != nil {
@@ -140,7 +167,6 @@ func main() {
 	if browserRestartInterval > 0 {
 		fmt.Printf(" - Browser will restart every %d seconds\n", browserRestartInterval)
 		go func() {
-			fmt.Println("Starting browser restart ticker")
 			ticker := time.NewTicker(time.Duration(browserRestartInterval) * time.Second)
 			defer ticker.Stop()
 
@@ -154,9 +180,6 @@ func main() {
 			}
 		}()
 	}
-
-	pool := rod.NewPagePool(pagePoolSize)
-	// pagePoolSize == cap(pool)
 
 	createPage := func() (*rod.Page, error) {
 		browserLock.Lock()
@@ -193,6 +216,49 @@ func main() {
 		})
 	}))
 
+	// renderPDF handles the core PDF rendering logic. It returns the PDF data or an error.
+	// If the error is a closed connection error, it returns true for the retry flag.
+	renderPDF := func(page *rod.Page, navigateURL string, htmlBody []byte, request *http.Request, logger *log.Entry) ([]byte, bool, error) {
+		var err error
+
+		if htmlBody != nil {
+			dataUrl := "data:text/html;charset=utf-8," + url.PathEscape(string(htmlBody))
+			logger.Infoln("Navigating to data URL")
+			err = page.Navigate(dataUrl)
+		} else {
+			logger.Infof("Navigating to URL: %s", navigateURL)
+			err = page.Navigate(navigateURL)
+		}
+
+		if err != nil {
+			return nil, isClosedConnectionError(err), fmt.Errorf("error navigating: %w", err)
+		}
+
+		if err = page.WaitLoad(); err != nil {
+			return nil, isClosedConnectionError(err), fmt.Errorf("error waiting for page to load: %w", err)
+		}
+		if err = page.WaitStable(time.Second); err != nil {
+			logger.Warnf("Error waiting for page to be stable: %s", err)
+		}
+		if err = page.WaitIdle(time.Second); err != nil {
+			logger.Warnf("Error waiting for page to be idle: %s", err)
+		}
+
+		pdf := pageToPDF(page, getPDFOptionsFromRequest(request), logger)
+		defer func() {
+			if err := pdf.Close(); err != nil {
+				logger.Warnf("Error closing PDF: %s", err)
+			}
+		}()
+
+		data, err := io.ReadAll(pdf)
+		if err != nil {
+			return nil, isClosedConnectionError(err), fmt.Errorf("error reading PDF: %w", err)
+		}
+
+		return data, false, nil
+	}
+
 	// Handler for the PDF endpoint
 	pdfHandler := func(response http.ResponseWriter, request *http.Request) {
 		start := time.Now()
@@ -211,25 +277,11 @@ func main() {
 			return
 		}
 
-		// Get a page from the pool
-		page, err := pool.Get(createPage)
-		if err != nil {
-			msg := "Error creating page"
-			http.Error(response, msg, http.StatusInternalServerError)
-			logger.Errorf("%s: %s", msg, err)
-			return
-		}
-		logger.Debugf("Got page from pool after %s", time.Since(start))
-		logPoolSize(logger)
-
-		defer func() {
-			// Put the page back in the pool
-			pool.Put(page)
-			logPoolSize(logger)
-		}()
+		// Determine navigation target
+		var navigateURL string
+		var htmlBody []byte
 
 		if request.Method == "POST" {
-			// The HTML to render is in the request body.
 			body, err := io.ReadAll(request.Body)
 			if err != nil {
 				msg := "Error reading request body"
@@ -237,19 +289,11 @@ func main() {
 				logger.Warnf("%s: %s", msg, err)
 				return
 			}
-			dataUrl := "data:text/html;charset=utf-8," + url.PathEscape(string(body))
-			logger.Infoln("Rendering page from data URL")
-
 			if err = request.Body.Close(); err != nil {
 				logger.Warnf("Error closing request body: %s", err)
 			}
-			logger.Infoln("Navigating to data URL")
-			if err = page.Navigate(dataUrl); err != nil {
-				msg := "Error navigating to data URL"
-				http.Error(response, msg, http.StatusInternalServerError)
-				logger.Errorf("%s: %s", msg, err)
-				return
-			}
+			htmlBody = body
+			logger.Infoln("Rendering page from POST body")
 		}
 
 		if request.Method == "GET" {
@@ -260,56 +304,64 @@ func main() {
 				http.Error(response, msg, http.StatusBadRequest)
 				return
 			}
+			navigateURL = query.Get("url")
+			logger.Infoln("Rendering url")
+		}
 
-			pageUrl := query.Get("url")
-			logger.Infof("Navigating to URL: %s", pageUrl)
-			if err = page.Navigate(pageUrl); err != nil {
-				msg := "Error navigating to URL"
+		// Try to render the PDF, with one retry on connection errors
+		maxAttempts := 2
+		for attempt := 1; attempt <= maxAttempts; attempt++ {
+			// Get a page from the pool
+			page, err := pool.Get(createPage)
+			if err != nil {
+				if isClosedConnectionError(err) && attempt < maxAttempts {
+					logger.Warnf("Browser connection lost while creating page, reconnecting (attempt %d/%d)", attempt, maxAttempts)
+					if reconnectErr := connectBrowser(); reconnectErr != nil {
+						logger.Errorf("Failed to reconnect browser: %s", reconnectErr)
+					}
+					continue
+				}
+				msg := "Error creating page"
 				http.Error(response, msg, http.StatusInternalServerError)
 				logger.Errorf("%s: %s", msg, err)
 				return
 			}
-		}
+			logger.Debugf("Got page from pool after %s", time.Since(start))
+			logPoolSize(logger)
 
-		start = time.Now()
-		if err = page.WaitLoad(); err != nil {
-			msg := "Error waiting for page to load"
-			http.Error(response, msg, http.StatusInternalServerError)
-			logger.Errorf("%s: %s", msg, err)
-			return
-		}
-		if err = page.WaitStable(time.Second); err != nil {
-			logger.Warnf("Error waiting for page to be stable: %s", err)
-		}
-		if err = page.WaitIdle(time.Second); err != nil {
-			logger.Warnf("Error waiting for page to be idle: %s", err)
-		}
-		logger.Debugf("Page loaded in %v", time.Since(start))
+			logger.Debugf("Rendering PDF (attempt %d/%d)", attempt, maxAttempts)
+			data, shouldRetry, renderErr := renderPDF(page, navigateURL, htmlBody, request, logger)
 
-		pdf := pageToPDF(page, getPDFOptionsFromRequest(request), logger)
-		defer func() {
-			if err := pdf.Close(); err != nil {
-				logger.Warnf("Error closing PDF: %s", err)
+			// Put the page back in the pool
+			pool.Put(page)
+			logPoolSize(logger)
+
+			if renderErr != nil {
+				if shouldRetry && attempt < maxAttempts {
+					logger.Warnf("Browser connection lost during rendering, reconnecting and retrying (attempt %d/%d): %s", attempt, maxAttempts, renderErr)
+					if reconnectErr := connectBrowser(); reconnectErr != nil {
+						logger.Errorf("Failed to reconnect browser: %s", reconnectErr)
+						http.Error(response, "Browser connection lost and reconnect failed", http.StatusInternalServerError)
+						return
+					}
+					continue
+				}
+				http.Error(response, renderErr.Error(), http.StatusInternalServerError)
+				logger.Errorf("Render failed: %s", renderErr)
+				return
 			}
-		}()
 
-		response.Header().Set("Content-Type", "application/pdf")
-
-		data, err := io.ReadAll(pdf)
-		if err != nil {
-			msg := "Error reading PDF"
-			logger.Warnf("%s: %s", msg, err)
-			http.Error(response, msg, http.StatusInternalServerError)
+			// Success
+			response.Header().Set("Content-Type", "application/pdf")
+			logger.Debugf("PDF size: %d bytes", len(data))
+			if _, err := response.Write(data); err != nil {
+				msg := "Error writing PDF"
+				logger.Warnf("%s: %s", msg, err)
+				return
+			}
+			logger.Infof("Completed request after %s", time.Since(start))
 			return
 		}
-		logger.Debugf("PDF size: %d bytes", len(data))
-		if _, err := response.Write(data); err != nil {
-			msg := "Error writing PDF"
-			logger.Warnf("%s: %s", msg, err)
-			http.Error(response, msg, http.StatusInternalServerError)
-			return
-		}
-		logger.Infof("Completed request after %s", time.Since(start))
 	}
 
 	http.HandleFunc(pdfEndpoint, recoverPanic(pdfHandler))
