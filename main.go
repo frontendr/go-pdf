@@ -123,13 +123,22 @@ func main() {
 		browserLock.Lock()
 		defer browserLock.Unlock()
 
-		// Drain the page pool - old pages are connected to the old browser
+		// Drain the page pool - old pages are connected to the old browser.
+		// Cleanup() removes elements from the channel but does not refill it,
+		// so we need to refill it with nil entries afterwards to unblock Get().
 		pool.Cleanup(func(p *rod.Page) {
 			log.Debug("Closing stale page from pool")
 			if err := p.Close(); err != nil {
 				log.Warnf("Error closing stale page: %s", err)
 			}
 		})
+		// Refill the pool with nil entries so Get() can create fresh pages
+		for i := 0; i < cap(pool); i++ {
+			select {
+			case pool <- nil:
+			default:
+			}
+		}
 
 		if browser != nil {
 			if err := browser.Close(); err != nil {
